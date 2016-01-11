@@ -14,6 +14,8 @@ module Moo.Core
     , envStoreName
     , loadConfiguration) where
 
+import Data.List.Split (wordsBy)
+import Data.Char (isSpace)
 import Control.Applicative ((<$>), (<*>))
 import Control.Monad.Reader (ReaderT)
 import qualified Data.Configurator as C
@@ -23,12 +25,15 @@ import Data.Char (toLower)
 import Database.HDBC.PostgreSQL (connectPostgreSQL)
 import Database.HDBC.Sqlite3 (connectSqlite3)
 import System.Environment (getEnvironment)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, fromMaybe)
+import qualified Database.MySQL.Simple as MySQL
+import qualified Database.MySQL.Base as MySQLB
 
 import Database.Schema.Migrations ()
 import Database.Schema.Migrations.Store (MigrationStore, StoreData)
 import Database.Schema.Migrations.Backend
 import Database.Schema.Migrations.Backend.HDBC
+import Database.Schema.Migrations.Backend.MySQL
 
 -- |The monad in which the application runs.
 type AppT a = ReaderT AppState IO a
@@ -46,6 +51,7 @@ data AppState = AppState { _appOptions          :: CommandOptions
                          , _appDatabaseType     :: String
                          , _appStoreData        :: StoreData
                          , _appLinearMigrations :: Bool
+                         , _appTimestampFilenames :: Bool
                          }
 
 type ShellEnvironment = [(String, String)]
@@ -55,7 +61,8 @@ data Configuration = Configuration
     , _databaseType       :: String
     , _migrationStorePath :: FilePath
     , _linearMigrations   :: Bool
-    }
+    , _timestampFilenames :: Bool
+    } deriving Show
 
 -- |Intermediate type used during config loading.
 data LoadConfig = LoadConfig
@@ -63,22 +70,23 @@ data LoadConfig = LoadConfig
     , _lcDatabaseType       :: Maybe String
     , _lcMigrationStorePath :: Maybe FilePath
     , _lcLinearMigrations   :: Maybe Bool
-    }
+    , _lcTimestampFilenames :: Maybe Bool
+    } deriving Show
 
 defConfigFile :: String
 defConfigFile = "moo.cfg"
 
 newLoadConfig :: LoadConfig
-newLoadConfig = LoadConfig Nothing Nothing Nothing Nothing
+newLoadConfig = LoadConfig Nothing Nothing Nothing Nothing Nothing
 
 isValidConfig :: LoadConfig -> Bool
-isValidConfig (LoadConfig a b c _) = and $ map isJust [a, b, c]
+isValidConfig (LoadConfig a b c _ _) = all isJust [a, b, c]
 
 loadConfigToConfig :: LoadConfig -> Configuration
-loadConfigToConfig (LoadConfig (Just cs) (Just dt) (Just msp) lm) =
-    case lm of
-      Just lm' -> Configuration cs dt msp lm'
-      _        -> Configuration cs dt msp False
+loadConfigToConfig (LoadConfig (Just cs) (Just dt) (Just msp) lm ts) =
+  Configuration cs dt msp
+    (fromMaybe False lm)
+    (fromMaybe False ts)
 loadConfigToConfig _ = error "LoadConfig is invalid!"
 
 -- |Setters for fields of 'LoadConfig'.
@@ -90,6 +98,8 @@ lcMigrationStorePath c v = c { _lcMigrationStorePath = v }
 
 lcLinearMigrations :: LoadConfig -> Maybe Bool -> LoadConfig
 lcLinearMigrations c v   = c { _lcLinearMigrations   = v }
+lcTimestampFilenames c v = c { _lcTimestampFilenames = v }
+
 
 -- | @f .= v@ invokes f only if v is 'Just'
 (.=) :: (Monad m) => (a -> Maybe b -> a) -> m (Maybe b) -> m (a -> a)
@@ -120,6 +130,7 @@ applyConfigFile cfg lc =
               & lcDatabaseType       .= f envDatabaseType
               & lcMigrationStorePath .= f envStoreName
               & lcLinearMigrations   .= f envLinearMigrations
+              & lcTimestampFilenames .= f envTimestampFilenames
     where
         f :: Configured a => String -> IO (Maybe a)
         f = C.lookup cfg . T.pack
@@ -132,6 +143,7 @@ loadConfiguration pth = do
                   (\p -> C.load [C.Required p]) pth
     env <- getEnvironment
     cfg <- applyConfigFile file newLoadConfig >>= applyEnvironment env
+
     if isValidConfig cfg
        then return $ Right $ loadConfigToConfig cfg
        else return $ Left "Configuration is invalid, check if everything is set."
@@ -172,7 +184,33 @@ newtype DbConnDescriptor = DbConnDescriptor String
 databaseTypes :: [(String, String -> IO Backend)]
 databaseTypes = [ ("postgresql", fmap hdbcBackend . connectPostgreSQL)
                 , ("sqlite3", fmap hdbcBackend . connectSqlite3)
+                , ("mysql", fmap mysqlBackend . connectMySQL)
                 ]
+
+-- A slightly hacky connection string parser for MySQL, because mysql-simple
+-- doesn't come with one.
+connectMySQL :: String -> IO MySQL.Connection
+connectMySQL connectionString =
+  let kvs =
+        [(map toLower (trimlr k),trimlr v) | kvPair <-
+                                              wordsBy (== ';') connectionString :: [String]
+                                           , let (k,v) = case wordsBy (== '=') kvPair of
+                                                           (k:v:_) -> (k,v)
+                                                           [k] -> (k,"")
+                                                           [] -> error "impossible"]
+      trimlr = takeWhile (not . isSpace) . dropWhile isSpace
+      connInfo =
+        MySQL.ConnectInfo
+          <$> lookup "host" kvs
+          <*> pure (read (fromMaybe "3306" (lookup "port" kvs)))
+          <*> lookup "user" kvs
+          <*> pure (fromMaybe "" (lookup "password" kvs))
+          <*> lookup "database" kvs
+          <*> pure [MySQLB.MultiStatements]
+          <*> pure ""
+          <*> pure Nothing
+  in MySQL.connect (fromMaybe (error "Invalid connection string. Expected form: host=hostname; user=username; port=portNumber; database=dbname; password=pwd.")
+                              connInfo)
 
 envDatabaseType :: String
 envDatabaseType = "DBM_DATABASE_TYPE"
@@ -185,3 +223,6 @@ envStoreName = "DBM_MIGRATION_STORE"
 
 envLinearMigrations :: String
 envLinearMigrations = "DBM_LINEAR_MIGRATIONS"
+
+envTimestampFilenames :: String
+envTimestampFilenames = "DBM_TIMESTAMP_FILENAMES"

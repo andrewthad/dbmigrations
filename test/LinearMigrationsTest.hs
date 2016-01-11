@@ -14,7 +14,6 @@ import           Moo.Core
 
 tests :: IO [Test]
 tests = sequence [ addsMigration
-                 , doesNotSetTimestamp
                  , selectsLatestMigrationAsDep
                  , selectsOnlyLeavesAsDeps
                  , doesNotAddDependencyWhenLinearMigrationsAreDisabled
@@ -25,12 +24,6 @@ addsMigration = do
     state <- prepareState "first"
     mig <- addTestMigration state
     satisfies "Migration not added" mig isRight
-
-doesNotSetTimestamp :: IO Test
-doesNotSetTimestamp = do
-    state <- prepareState "first"
-    Right mig <- addTestMigration state
-    satisfies "Timestamp is set" (mTimestamp mig) isNothing
 
 selectsLatestMigrationAsDep :: IO Test
 selectsLatestMigrationAsDep = do
@@ -64,7 +57,7 @@ doesNotAddDependencyWhenLinearMigrationsAreDisabled = do
 addTestMigration :: AppState -> IO (Either String Migration)
 addTestMigration state = do
     let store = _appStore state
-    let [migrationId] = _appRequiredArgs state
+        [migrationId] = _appRequiredArgs state
     runReaderT (newCommand $ _appStoreData state) state
     loadMigration store migrationId
 
@@ -88,6 +81,7 @@ prepareState m = do
     , _appDatabaseType = "none"
     , _appStoreData = storeData
     , _appLinearMigrations = True
+    , _appTimestampFilenames = False
     }
 
 prepareStateWith :: AppState -> String -> IO AppState
